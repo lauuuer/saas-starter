@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 
-export function CheckoutButton({ label = "Assinar agora" }: { label?: string }) {
+export function CheckoutButton({ label = "Subscribe now" }: { label?: string }) {
   const [loading, setLoading] = useState(false);
 
   async function handleClick() {
@@ -19,7 +19,7 @@ export function CheckoutButton({ label = "Assinar agora" }: { label?: string }) 
       disabled={loading}
       className="rounded-md bg-[var(--accent)] px-6 py-3 font-medium text-black hover:opacity-90 transition disabled:opacity-50"
     >
-      {loading ? "Redirecionando..." : label}
+      {loading ? "Redirecting..." : label}
     </button>
   );
 }

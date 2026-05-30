@@ -14,7 +14,7 @@ export default async function DashboardPage() {
     <main className="min-h-screen px-6 py-12 max-w-3xl mx-auto">
       <header className="flex items-center justify-between">
         <div>
-          <p className="text-sm text-neutral-400">Bem-vindo,</p>
+          <p className="text-sm text-neutral-400">Welcome,</p>
           <h1 className="text-2xl font-bold">{session.user.name}</h1>
         </div>
         <form
@@ -24,7 +24,7 @@ export default async function DashboardPage() {
           }}
         >
           <button className="text-sm text-neutral-400 hover:text-white transition">
-            Sair
+            Sign out
           </button>
         </form>
       </header>
@@ -33,14 +33,14 @@ export default async function DashboardPage() {
         {subscription ? (
           <div className="rounded-xl border border-[var(--accent)]/40 bg-[var(--accent)]/5 p-8">
             <span className="text-xs uppercase tracking-widest text-[var(--accent)]">
-              Plano Pro ativo
+              Pro plan active
             </span>
-            <h2 className="mt-2 text-xl font-bold">Conteúdo premium liberado 🎉</h2>
+            <h2 className="mt-2 text-xl font-bold">Premium content unlocked 🎉</h2>
             <p className="mt-2 text-sm text-neutral-400">
               {subscription.currentPeriodEnd
-                ? `${subscription.cancelAtPeriodEnd ? "Acesso até" : "Renova em"} ${subscription.currentPeriodEnd.toLocaleDateString("pt-BR")}.`
-                : "Assinatura ativa."}
-              {subscription.cancelAtPeriodEnd && " (cancelamento agendado)"}
+                ? `${subscription.cancelAtPeriodEnd ? "Access until" : "Renews on"} ${subscription.currentPeriodEnd.toLocaleDateString("en-US")}.`
+                : "Subscription active."}
+              {subscription.cancelAtPeriodEnd && " (cancellation scheduled)"}
             </p>
             <div className="mt-6">
               <PortalButton />
@@ -48,15 +48,15 @@ export default async function DashboardPage() {
           </div>
         ) : (
           <div className="rounded-xl border border-neutral-800 p-8">
-            <h2 className="text-xl font-bold">Você ainda não tem o plano Pro</h2>
+            <h2 className="text-xl font-bold">You don&apos;t have the Pro plan yet</h2>
             <p className="mt-2 text-sm text-neutral-400">
-              Assine para desbloquear o conteúdo premium.
+              Subscribe to unlock premium content.
             </p>
             <Link
               href="/pricing"
               className="mt-6 inline-block rounded-md bg-[var(--accent)] px-6 py-3 font-medium text-black hover:opacity-90 transition"
             >
-              Ver planos
+              View plans
             </Link>
           </div>
         )}

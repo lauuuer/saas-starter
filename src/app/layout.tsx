@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "SaaS Starter — Auth + Payments",
-  description: "Plataforma de assinaturas com NextAuth, Prisma e Stripe.",
+  description: "A subscription platform built with NextAuth, Prisma, and Stripe.",
 };
 
 export default function RootLayout({
@@ -12,7 +12,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="pt-BR">
+    <html lang="en">
       <body>{children}</body>
     </html>
   );

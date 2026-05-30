@@ -7,18 +7,18 @@ export default function Home() {
         SaaS Starter
       </span>
       <h1 className="mt-4 text-5xl font-bold max-w-2xl leading-tight">
-        Assinaturas com auth, pagamentos e webhooks de verdade.
+        Subscriptions with real auth, payments, and webhooks.
       </h1>
       <p className="mt-6 max-w-xl text-neutral-400">
-        NextAuth + Prisma + Stripe. Fluxo completo de SaaS com verificação de
-        assinatura e idempotência — o que a maioria dos portfólios erra.
+        NextAuth + Prisma + Stripe. A complete SaaS flow with signature
+        verification and idempotency — the part most portfolios get wrong.
       </p>
       <div className="mt-10 flex gap-4">
         <Link
           href="/pricing"
           className="rounded-md bg-[var(--accent)] px-6 py-3 font-medium text-black hover:opacity-90 transition"
         >
-          Ver planos
+          View plans
         </Link>
         <Link
           href="/dashboard"

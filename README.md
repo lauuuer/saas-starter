@@ -1,196 +1,152 @@
-# SaaS Starter — Auth + Payments (Projeto 1)
+# SaaS Starter — Auth + Payments
 
-Plataforma de assinaturas com **NextAuth (Auth.js v5)**, **Prisma**, **PostgreSQL (Supabase)** e **Stripe** (modo de teste).
-Demonstra o fluxo completo de SaaS: login social, checkout de assinatura, webhooks idempotentes e dashboard com gating por plano.
+A production-minded subscription platform built with **Next.js 15 (App Router)**, **Auth.js v5 (NextAuth)**, **Prisma**, **PostgreSQL (Supabase)**, and **Stripe**. It demonstrates the full SaaS loop: social login, subscription checkout, **concurrency-safe idempotent webhooks**, and a plan-gated dashboard.
 
-## Stack
-
-| Camada       | Ferramenta                          |
-| ------------ | ----------------------------------- |
-| Framework    | Next.js 15 (App Router) + TypeScript |
-| Auth         | Auth.js v5 (NextAuth) — GitHub OAuth |
-| ORM          | Prisma                              |
-| DB           | Supabase (Postgres, free tier)      |
-| Pagamentos   | Stripe (test mode)                  |
-| UI           | Tailwind CSS                        |
-| Deploy       | Vercel                              |
+> **Live demo:** https://saas-starter-ashy.vercel.app/
+> Sign in with GitHub, then subscribe with Stripe test card `4242 4242 4242 4242` (any future expiry, any CVC).
 
 ---
 
-## Passo a passo
+## Why this project
 
-### 1. Pré-requisitos
-- Node.js 18.18+ (recomendado 20+)
-- Conta no GitHub, Supabase e Stripe (todas gratuitas)
-- Stripe CLI instalada (para testar webhooks localmente)
+Most payment integrations in a portfolio stop at "checkout works." This one focuses on the part that actually breaks in production: **the webhook pipeline**. It implements concurrency-safe idempotency, bounded retries with exponential backoff, a dead-letter path, an async reprocessing worker, and a health endpoint for alerting — all on **free tiers, with no extra infrastructure**.
 
-### 2. Instalar dependências
+## Tech stack
+
+| Layer       | Tool                                   |
+| ----------- | -------------------------------------- |
+| Framework   | Next.js 15 (App Router) + TypeScript   |
+| Auth        | Auth.js v5 (NextAuth) — GitHub OAuth   |
+| ORM         | Prisma                                 |
+| Database    | Supabase (PostgreSQL, free tier)       |
+| Payments    | Stripe (test mode)                     |
+| UI          | Tailwind CSS                           |
+| Hosting     | Vercel                                 |
+
+---
+
+## Architecture highlights
+
+### Production-grade webhook handler (`src/app/api/stripe/webhook/route.ts`)
+
+This is the core of the project and where most implementations get it wrong.
+
+1. **Signature verification on the raw body.** The body is read with `req.text()` **before** any parsing and validated via `stripe.webhooks.constructEvent`. Calling `req.json()` first would break verification in the App Router.
+
+2. **Concurrency-safe idempotency (claim-then-process).** Instead of `findUnique → process → create` (which has a check-then-act race that concurrent Stripe redeliveries can exploit in a serverless environment), the `event.id` is **inserted first** into a `WebhookEvent` table with status `processing`. The database's **unique constraint becomes the lock**: if the insert fails with `P2002`, another invocation already claimed the event and this one returns `2xx` without reprocessing. The concurrency barrier is the database, not a late application-level check.
+
+3. **Safe failure reprocessing.** A failed event is stored with status `failed`. On Stripe's redelivery, the handler reclaims it via an `updateMany` conditioned on the observed status (a compare-and-swap), preventing two concurrent retries from processing the same event simultaneously.
+
+4. **Stuck-event recovery.** If an invocation dies (cold-start kill, OOM) after claiming but before finishing, the event would be stuck in `processing` forever. A staleness window lets a later retry reclaim it.
+
+5. **Timeouts on every network call.** Both `subscriptions.retrieve` and the overall processing step have explicit timeouts (`withTimeout`). Without them, Stripe API **slowness** (not downtime) would hold the handler until the webhook response times out, triggering redeliveries and a retry storm. The timeout fails fast and responds predictably.
+
+6. **Avoids redundant retrieves.** `customer.subscription.*` events already include the `Subscription` object in the payload, so the code uses `event.data.object` directly — eliminating an unnecessary network round-trip per event.
+
+7. **Correct response per failure type.** Invalid signature → `400` (do not redeliver; it's junk/an attack). Database or processing failure → `500` (redeliver; it's transient). Unhandled event → `2xx` (recorded for audit, not processed).
+
+8. **Raw payload persisted.** The `WebhookEvent` table stores the raw payload, making the system ready to evolve toward fully async processing without re-fetching from Stripe.
+
+9. **Structured observability.** JSON logs (`src/lib/logger.ts`) with a correlation `requestId` and safe error serialization (no PII or huge objects leaked), instead of loose `console.error` calls.
+
+### Deliberate sync-vs-async trade-off
+
+The maximally robust pattern is to return `2xx` immediately after persisting the event and process the side effect in a separate worker/queue. To keep the project **100% free with no extra infrastructure**, I chose the middle path: persist the raw event, process inline **with a timeout and an atomic claim**, and leave the `WebhookEvent` table ready for a worker to plug in later. The trade-off is documented consciously — the kind of decision that separates "I made it work" from engineering judgment.
+
+### Async reprocessing worker (`src/app/api/cron/process-webhooks/route.ts`)
+
+A second line of defense for failed events. Stripe redelivers errored events for a few hours, then gives up. Without a fallback, billing state would stay permanently out of sync.
+
+- **Trigger:** Vercel Cron (free), configured in `vercel.json`.
+- **Work source:** the `WebhookEvent` table already holds each event's raw payload. The worker scans `failed` events whose `nextRetryAt` has passed plus stuck `processing` events — no Stripe re-fetch needed.
+- **Per-event atomic claim:** each event is claimed via an `updateMany` conditioned on the observed status (compare-and-swap), so two cron runs — or the cron racing the handler — never reprocess the same event at once.
+- **Exponential backoff with jitter** (`src/lib/retry-policy.ts`): repeated failures push the next attempt progressively further out, and jitter avoids a thundering herd when many events fail together (e.g. a Stripe outage).
+- **Dead-letter:** after `MAX_ATTEMPTS` (8), an event moves to `dead_letter` instead of retrying forever. This state emits an error log and should trigger an alert — it means a user's billing may be out of sync and needs manual intervention.
+- **Time guard:** the loop respects a deadline below the function's `maxDuration` so it isn't killed mid-event.
+- **Shared logic:** handler and worker both use the same `processEvent` (`src/lib/webhook-processor.ts`), guaranteeing identical behavior on both paths.
+
+> **Free-tier limit (documented):** Vercel Cron on the Hobby plan runs **at most once per day** and does not retry failed invocations. The worker uses a generous batch size to drain the backlog in one pass. Since Stripe already covers the first few hours of retries, a daily worker is sufficient as the final safety net. On a paid plan, simply lower the batch and change the `schedule` in `vercel.json` to something like `*/5 * * * *`.
+
+### Observability and alerting (`src/app/api/health/webhooks/route.ts`)
+
+A health endpoint exposing pipeline health without leaking PII — only aggregate counts and timestamps. Designed to be consumed by a free external HTTP monitor (UptimeRobot, BetterStack, Pingdom):
+
+- **`counts`**: events per status (`processing`, `processed`, `failed`, `dead_letter`).
+- **`oldestPendingAgeMs`**: age of the oldest pending event. If it grows, the worker has stalled.
+- **derived `status`**: `healthy` / `degraded` / `unhealthy`. Any `dead_letter > 0` → **unhealthy** and **HTTP 503**, so status-code-only monitors alert too.
+
+The endpoint is protected by `HEALTH_TOKEN`, accepted via `Authorization: Bearer` header or `?token=` query string (for monitors that can't send custom headers on the free tier).
+
+### Other resilience decisions
+
+- **Stripe API version compatibility.** Recent Stripe API versions moved `current_period_end` from the subscription level to each item (`items.data[].current_period_end`). Code reading the old field gets `undefined` silently — and in billing, that denies access to a paying user. `extractCurrentPeriodEnd` reads the item level with a top-level fallback, covering both shapes.
+- **Stripe Customer creation race.** Two concurrent checkouts could create two Customers (an unguarded dual-write), orphaning one. Solved with an `idempotencyKey` derived from the `userId`: Stripe returns the same Customer.
+- **Resilient webhook reconciliation.** `syncSubscription` reconciles first by `stripeCustomerId`; if not found, it falls back to the `userId` propagated via `metadata` (written on both the checkout session and the subscription via `subscription_data.metadata`) and repairs the link (self-healing). Without this, a paid subscription could be silently dropped.
+- **Explicit status mapping.** An unknown Stripe status throws (and enters the retry flow) instead of becoming invalid data via `as any`.
+- **Surface hardening.** A real-byte body-size cap on the public endpoint; the worker is protected by `CRON_SECRET`.
+
+---
+
+## Getting started
+
+### Prerequisites
+- Node.js 20+
+- Free accounts on GitHub, Supabase, and Stripe
+- Stripe CLI (for local webhook testing)
+
+### 1. Install
 ```bash
 npm install
 ```
 
-### 3. Banco de dados (Supabase)
-1. Crie um projeto em https://supabase.com
-2. Em **Project Settings → Database → Connection string**, copie:
-   - A **Connection pooling** string (porta 6543) → `DATABASE_URL` — **adicione** `?pgbouncer=true&connection_limit=1` ao final (essencial em serverless)
-   - A **Direct connection** string (porta 5432) → `DIRECT_URL`
-3. Cole no `.env` (veja `.env.example`)
+### 2. Database (Supabase)
+1. Create a project at https://supabase.com
+2. Click the **Connect** button in the top bar of the project dashboard. From the modal:
+   - **Transaction pooler** (port `6543`) → `DATABASE_URL`. Append `?pgbouncer=true&connection_limit=1` (essential in serverless).
+   - **Direct connection** (port `5432`) → `DIRECT_URL` (used only for migrations).
+3. Replace the `[YOUR-PASSWORD]` placeholder with your real database password (Settings → Database → Database password). Prefer a password without special characters to avoid URL-encoding issues.
 
-### 4. Variáveis de ambiente
-Copie `.env.example` para `.env` e preencha:
-```bash
-cp .env.example .env
-```
-Gere o `AUTH_SECRET`:
+### 3. Environment variables
+Copy `.env.example` to `.env` and fill it in. Generate the auth secret with:
 ```bash
 npx auth secret
 ```
 
-### 5. GitHub OAuth (login)
-1. https://github.com/settings/developers → **New OAuth App**
-2. Homepage URL: `http://localhost:3000`
-3. Callback URL: `http://localhost:3000/api/auth/callback/github`
-4. Copie `Client ID` e `Client Secret` → `.env`
-
-### 6. Stripe
-1. https://dashboard.stripe.com (deixe em **Test mode**)
-2. **Developers → API keys**: copie a Secret key → `STRIPE_SECRET_KEY`
-3. Crie um produto com preço recorrente: **Product catalog → Add product**
-   - Copie o `price_id` (começa com `price_`) → `STRIPE_PRICE_ID`
-
-### 7. Migrar o banco
+### 4. Run migrations
 ```bash
 npx prisma migrate dev --name init_auth_billing_webhooks
-npx prisma generate
 ```
 
-### 8. Rodar localmente
+### 5. Stripe setup
+- Create a **recurring** product in the Stripe Dashboard (Product catalog) and copy its **price ID** (`price_...`, not `prod_...`) into `STRIPE_PRICE_ID`.
+- Copy your **test secret key** (`sk_test_...`) into `STRIPE_SECRET_KEY`.
+
+### 6. Run locally
 ```bash
 npm run dev
 ```
 
-### 9. Testar webhooks localmente
-Em outro terminal:
+### 7. Test webhooks locally
+In a separate terminal:
 ```bash
-stripe login
 stripe listen --forward-to localhost:3000/api/stripe/webhook
 ```
-A CLI imprime um `whsec_...` → cole em `STRIPE_WEBHOOK_SECRET` no `.env` e reinicie o dev server.
-
-Para disparar um evento de teste:
-```bash
-stripe trigger checkout.session.completed
-```
-
-### 10. Fluxo de teste de pagamento
-1. Faça login em `/login`
-2. Vá em `/pricing` e assine
-3. Use o cartão de teste: `4242 4242 4242 4242`, qualquer data futura, qualquer CVC
-4. O webhook confirma a assinatura → o `/dashboard` libera o conteúdo premium
-
-### 11. Testar o worker de reprocessamento localmente
-Defina um `CRON_SECRET` no `.env` e chame a rota manualmente:
-```bash
-curl -H "Authorization: Bearer SEU_CRON_SECRET" \
-  http://localhost:3000/api/cron/process-webhooks
-```
-Para simular o caminho de recuperação: force uma falha (ex.: derrube o banco momentaneamente durante um `stripe trigger`), confirme que o evento ficou em `failed` na tabela `WebhookEvent`, e rode o worker — ele deve reprocessar e marcar `processed`.
+The CLI prints a `whsec_...` → put it in `STRIPE_WEBHOOK_SECRET` and restart the dev server. Then sign in, subscribe with card `4242 4242 4242 4242`, and confirm each delivery returns `[200]`.
 
 ---
 
-## Pontos que diferenciam este projeto (documente no README do seu portfólio)
+## Deploy to Vercel
 
-### Webhook à prova de produção (`src/app/api/stripe/webhook/route.ts`)
+1. Push to GitHub and import the repo on Vercel.
+2. Add all environment variables. **Do not** set `CRON_SECRET` — Vercel provisions it automatically for the cron job.
+3. After the first deploy, set `NEXT_PUBLIC_APP_URL` to the live URL and redeploy.
+4. **GitHub OAuth (production):** create an OAuth App with callback URL `https://your-app.vercel.app/api/auth/callback/github`; set `AUTH_GITHUB_ID` / `AUTH_GITHUB_SECRET`.
+5. **Stripe webhook (production):** add an endpoint at `https://your-app.vercel.app/api/stripe/webhook` listening to `checkout.session.completed`, `customer.subscription.created`, `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.payment_failed`. Put the endpoint's signing secret in `STRIPE_WEBHOOK_SECRET`.
 
-Este é o coração do projeto e onde a maioria dos portfólios falha. Decisões:
+> **Serverless database note:** in production, `DATABASE_URL` must point to the Supabase pooler in transaction mode with `?pgbouncer=true&connection_limit=1`. Each serverless invocation is an ephemeral process; without the pooler and a tiny per-container pool, concurrency spikes (including a webhook retry storm) exhaust the connection limit and take down **every** route that touches the database.
 
-1. **Verificação de assinatura com raw body.** O body é lido com `req.text()` **antes** de qualquer parse e validado com `stripe.webhooks.constructEvent`. Fazer `req.json()` antes quebra a verificação no App Router.
+---
 
-2. **Idempotência à prova de concorrência (claim-then-process).** Em vez de `findUnique` → processar → `create` (que tem uma janela de corrida entre o check e o act, furável por reentregas concorrentes do Stripe em ambiente serverless), o `event.id` é **inserido primeiro** numa tabela `WebhookEvent` com status `processing`. O `unique constraint` do banco **vira o lock**: se o insert falha com `P2002`, outra invocação já reivindicou o evento e esta retorna 2xx sem reprocessar. A barreira de concorrência é o banco, não uma checagem aplicacional tardia.
+## License
 
-3. **Reprocessamento seguro de falhas.** Um evento que falhou fica com status `failed`. Quando o Stripe reentrega, o handler detecta o estado e faz *reclaim* via `updateMany` condicionado ao status (um compare-and-swap), evitando que dois retries concorrentes reprocessem ao mesmo tempo.
-
-4. **Recuperação de eventos "presos".** Se uma invocação morre (cold-start kill, OOM) após reivindicar mas antes de finalizar, o evento ficaria eternamente em `processing`. Uma janela de *staleness* (`STALE_MS`) permite que um retry posterior recupere o evento.
-
-5. **Timeout em toda chamada de rede.** Tanto `subscriptions.retrieve` quanto o processamento global têm timeout explícito (`withTimeout`). Sem isso, uma **lentidão** (não indisponibilidade) da API do Stripe seguraria o handler até estourar o tempo de resposta do webhook, gerando reentregas e uma *retry storm*. O timeout corta cedo e responde de forma previsível.
-
-6. **Evita `retrieve` redundante.** Eventos `customer.subscription.*` já trazem o objeto `Subscription` no payload; o código usa `event.data.object` diretamente nesses casos, eliminando uma ida à rede desnecessária por evento.
-
-7. **Resposta correta por tipo de falha.** Assinatura inválida → 400 (não reentregar; é lixo/ataque). Falha de banco ou de processamento → 500 (reentregar; é transitório). Evento não tratado → 2xx (registrado para auditoria, sem processar).
-
-8. **Payload cru persistido.** A tabela `WebhookEvent` guarda o payload, deixando o sistema pronto para evoluir para **processamento 100% assíncrono** (worker/cron lendo eventos `failed`/`processing`) sem re-buscar no Stripe — o próximo passo natural de escala.
-
-9. **Observabilidade.** Logs estruturados em JSON (`src/lib/logger.ts`) com `requestId` de correlação e serialização segura de erros (sem vazar PII/objetos gigantes), em vez de `console.error` solto.
-
-### Decisão consciente sobre processamento assíncrono
-
-O padrão de robustez máxima é responder 2xx imediatamente após persistir o evento e processar o efeito num worker/fila separada. Para manter o projeto **100% gratuito e sem infra extra**, optei pelo padrão intermediário: persistir o evento cru, processar inline **com timeout e claim atômico**, e deixar a tabela `WebhookEvent` pronta para um worker plugar depois. Trade-off documentado conscientemente — é exatamente o tipo de decisão que diferencia engenharia sênior de "fiz funcionar".
-
-### Configuração de banco (crítico em serverless)
-
-Em produção, a `DATABASE_URL` **deve** apontar para o pooler do Supabase em transaction mode com `?pgbouncer=true&connection_limit=1`. Cada invocação serverless é um processo efêmero; sem o pooler e um pool minúsculo por container, picos de concorrência (inclusive uma retry storm de webhook) esgotam o limite de conexões e derrubam **todas** as rotas que tocam o banco — não só o webhook. A `DIRECT_URL` (porta 5432) é usada apenas para migrations.
-
-### Worker assíncrono de reprocessamento (`src/app/api/cron/process-webhooks/route.ts`)
-
-Segunda linha de defesa para eventos que falharam. O Stripe reentrega eventos com erro por algumas horas, mas eventualmente desiste. Quando isso acontece, o estado de billing ficaria permanentemente dessincronizado. O worker resolve isso:
-
-- **Acionamento:** Vercel Cron (gratuito), configurado em `vercel.json`.
-- **Fonte de trabalho:** a tabela `WebhookEvent` já guarda o payload cru de cada evento. O worker varre eventos em `failed` (cujo `nextRetryAt` já passou) e `processing` presos (stale), sem precisar re-buscar nada no Stripe.
-- **Claim atômico por evento:** cada evento é reivindicado via `updateMany` condicionado ao status observado (compare-and-swap), então duas execuções do cron — ou o cron concorrendo com o handler — nunca reprocessam o mesmo evento ao mesmo tempo.
-- **Backoff exponencial com jitter** (`src/lib/retry-policy.ts`): falhas repetidas afastam progressivamente a próxima tentativa, e o jitter evita *thundering herd* quando muitos eventos falham juntos (ex.: Stripe fora do ar).
-- **Dead-letter:** após `MAX_ATTEMPTS`, o evento vai para `dead_letter` em vez de tentar para sempre. Esse estado emite log de erro e deve disparar um alarme — significa que um usuário pode estar com billing dessincronizado e requer intervenção manual.
-- **Guarda de tempo:** o loop respeita um deadline (`LOOP_DEADLINE_MS`) abaixo do `maxDuration` da função, para não ser morto no meio de um evento.
-- **Lógica compartilhada:** handler e worker usam o mesmo `processEvent` (`src/lib/webhook-processor.ts`), garantindo comportamento idêntico nos dois caminhos.
-
-> **Limite do plano grátis (documentado conscientemente):** o Vercel Cron no plano Hobby roda **no máximo 1x/dia** e **não faz retry** de invocações falhas. Por isso o worker usa um batch generoso (50) para drenar o backlog numa passada. Como o Stripe já cobre as primeiras horas de retry, um worker diário é suficiente como rede de segurança final. Em produção real (plano Pro), basta reduzir o batch e mudar o `schedule` em `vercel.json` para algo como `*/5 * * * *`.
-
-### Observabilidade e alarmes (`src/app/api/health/webhooks/route.ts`)
-
-Endpoint de health que expõe a saúde do pipeline de webhooks sem vazar PII — apenas contagens agregadas e timestamps. Projetado para ser consumido por um monitor HTTP externo gratuito (UptimeRobot, BetterStack, Pingdom):
-
-- **`counts`**: quantidade de eventos por status (`processing`, `processed`, `failed`, `dead_letter`).
-- **`oldestPendingAgeMs`**: idade do evento pendente mais antigo. Se cresce, é sinal de worker parado (cron não rodou).
-- **`status`** derivado: `healthy` / `degraded` / `unhealthy`.
-  - Qualquer `dead_letter` > 0 → **unhealthy** (billing dessincronizado para algum usuário; exige intervenção). Retorna **HTTP 503** para que monitores que só olham status code também alertem.
-  - Backlog de `failed` acima do limiar, ou evento pendente muito antigo → **degraded**.
-
-**Como configurar o alarme (grátis):** crie um monitor HTTP apontando para `https://SEU-DOMINIO/api/health/webhooks?token=<HEALTH_TOKEN>` e alerte quando o status code for 503 ou o corpo contiver `"unhealthy"`. O endpoint é protegido por `HEALTH_TOKEN`; o token é aceito via header `Authorization: Bearer` ou querystring `?token=` (para monitores que não permitem custom headers no free tier).
-
-O worker e o handler também emitem o log estruturado `webhook.dead_letter` / `worker.dead_letter` (nível error) — se você usar um coletor de logs (Axiom, Datadog), pode alarmar diretamente nesse evento.
-
-### Achados da 3ª revisão (correções de alto impacto)
-
-1. **Teto de tentativas agora é respeitado nos DOIS caminhos.** Antes, só o worker aplicava `MAX_ATTEMPTS`; o handler do webhook reprocessava inline a cada reentrega do Stripe. Como o Stripe reentrega por até **3 dias** (confirmado na doc), um evento com falha determinística seria reprocessado dezenas de vezes — desperdiçando invocação, conexão de banco e uma chamada à API do Stripe a cada vez. Agora handler e worker compartilham `decideFailureOutcome` (`src/lib/retry-policy.ts`): ao exceder o teto, o evento vira `dead_letter` e o handler responde **200** (não 500), fazendo o Stripe parar de insistir num evento que já abandonamos para inspeção manual.
-
-2. **Política de falha unificada (DRY + corretude).** A decisão "failed com backoff vs dead_letter" estava duplicada e com semântica divergente entre handler (`>=`) e worker (`>`). Centralizada numa única função, eliminando a divergência.
-
-3. **Query a menos no hot path de erro.** O handler relia `attempts` do banco no catch (query extra). Agora o valor é carregado uma vez no claim/reclaim e reusado.
-
-4. **Import órfão removido.** Um `import { Prisma }` não utilizado no worker quebraria o build do Next com lint estrito. Varredura de imports órfãos feita em todos os arquivos.
-
-### Achados de robustez corrigidos (histórico de code review)
-
-Documentado para mostrar o raciocínio de engenharia, não só o resultado:
-
-1. **Idempotência à prova de concorrência (claim-then-process).** Substituiu o padrão check-then-act, que tinha janela de corrida furável por reentregas concorrentes do Stripe em serverless. O `unique constraint` virou o lock.
-
-2. **Compatibilidade com a API Basil do Stripe.** A partir de 2025-03-31, o Stripe **removeu** `current_period_end` do nível da Subscription e moveu para os itens (`items.data[].current_period_end`). Código que lê o campo antigo recebe `undefined` silenciosamente — e em billing isso nega acesso a quem pagou. O `extractCurrentPeriodEnd` lê o item-level com fallback para o top-level, cobrindo Acacia e Basil.
-
-3. **Race na criação do Stripe Customer.** Dois checkouts concorrentes podiam criar dois Customers (dual-write sem proteção), deixando um órfão. Resolvido com `idempotencyKey` derivada do `userId`: o Stripe retorna o mesmo Customer.
-
-4. **Reconciliação resiliente no webhook.** O `syncSubscription` reconcilia primeiro pelo `stripeCustomerId`; se não achar (ex.: o vínculo no DB falhou ao gravar), cai para o `userId` propagado via `metadata` (gravado na checkout session **e** na própria subscription via `subscription_data.metadata`), e repara o vínculo (self-healing). Sem isso, uma subscription paga poderia ser silenciosamente ignorada.
-
-5. **Status mapeado com falha explícita.** Status desconhecido do Stripe lança erro (e cai no fluxo de retry) em vez de virar dado inválido no banco via `as any`.
-
-6. **Edge cases de data.** `current_period_end` ausente vira `null` tratado (sem `Invalid Date`); o `billing.ts` nega acesso conservadoramente quando a data é nula.
-
-7. **Defesa de superfície.** Teto de tamanho de body (em bytes reais via `Buffer.byteLength`) no endpoint público; worker protegido por `CRON_SECRET`.
-
-8. **Observabilidade.** Logs estruturados JSON com correlação por `requestId`/`eventId` e serialização de erro sem vazar PII.
-
-
-## Deploy na Vercel
-1. Push para o GitHub e importe na Vercel
-2. Configure as mesmas env vars (use as keys de produção do Stripe quando for ao vivo)
-3. No Stripe Dashboard, crie um endpoint de webhook apontando para `https://SEU-DOMINIO/api/stripe/webhook` e use o novo `whsec_` em produção
-4. Atualize a callback URL do GitHub OAuth para o domínio de produção
+MIT

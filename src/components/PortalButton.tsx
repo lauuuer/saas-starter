@@ -19,7 +19,7 @@ export function PortalButton() {
       disabled={loading}
       className="rounded-md border border-neutral-700 px-5 py-2.5 text-sm font-medium hover:border-neutral-500 transition disabled:opacity-50"
     >
-      {loading ? "Abrindo..." : "Gerenciar assinatura"}
+      {loading ? "Opening..." : "Manage subscription"}
     </button>
   );
 }
