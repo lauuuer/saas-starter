@@ -12,7 +12,7 @@ export default async function PricingPage() {
 
       <div className="mt-10 w-full max-w-sm rounded-xl border border-neutral-800 p-8">
         <div className="flex items-baseline gap-1">
-          <span className="text-4xl font-bold">$29</span>
+          <span className="text-4xl font-bold">$497</span>
           <span className="text-neutral-400">/month</span>
         </div>
         <ul className="mt-6 space-y-2 text-sm text-neutral-300">
