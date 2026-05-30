@@ -11,6 +11,8 @@ A production-minded subscription platform built with **Next.js 15 (App Router)**
 
 Most payment integrations in a portfolio stop at "checkout works." This one focuses on the part that actually breaks in production: **the webhook pipeline**. It implements concurrency-safe idempotency, bounded retries with exponential backoff, a dead-letter path, an async reprocessing worker, and a health endpoint for alerting — all on **free tiers, with no extra infrastructure**.
 
+> 📓 See [ENGINEERING_NOTES.md](./ENGINEERING_NOTES.md) for the full build journey — bugs hit, debugging, and the reasoning behind each decision.
+
 ## Tech stack
 
 | Layer       | Tool                                   |
