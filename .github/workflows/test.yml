@@ -1,0 +1,61 @@
+name: tests
+
+# Run on every push and pull request. The green check on the repo is the proof
+# that the resilience guarantees hold against a real Postgres, on every commit.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # Service containers run alongside the job. GitHub provides Docker on the
+    # runner for free, so a real Postgres is three lines of config — no
+    # Testcontainers, no external database needed.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: webhook_test
+        ports:
+          - 5432:5432
+        # Wait until Postgres is actually accepting connections before the job
+        # starts using it, otherwise the first query races the container boot.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # Both point at the service container. DIRECT_URL is what Prisma uses for
+      # schema operations (db push); DATABASE_URL is the runtime connection.
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/webhook_test
+      DIRECT_URL: postgresql://postgres:postgres@localhost:5432/webhook_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # `npm ci` installs exactly what's in package-lock.json (reproducible).
+      # The postinstall script runs `prisma generate`, which needs network
+      # access to binaries.prisma.sh — available on GitHub runners.
+      - name: Install dependencies
+        run: npm ci
+
+      # Apply the Prisma schema to the fresh service-container database.
+      - name: Push schema to test database
+        run: npx prisma db push --skip-generate
+
+      # Runs the full suite. The resilience test sees DATABASE_URL and runs
+      # against the real Postgres above; the unit tests run regardless.
+      - name: Run tests
+        run: npm test

@@ -10,6 +10,7 @@
     "postinstall": "prisma generate",
     "test": "vitest run",
     "test:watch": "vitest"
+    "test:resilience": "vitest run src/lib/webhook-resilience.test.ts"
   },
   "dependencies": {
     "@auth/prisma-adapter": "^2.7.4",
