@@ -1,5 +1,7 @@
 # SaaS Starter — Auth + Payments
 
+![tests](https://github.com/lauuuer/saas-starter/actions/workflows/test.yml/badge.svg)
+
 A production-minded subscription platform built with **Next.js 15 (App Router)**, **Auth.js v5 (NextAuth)**, **Prisma**, **PostgreSQL (Supabase)**, and **Stripe**. It demonstrates the full SaaS loop: social login, subscription checkout, **concurrency-safe idempotent webhooks**, and a plan-gated dashboard.
 
 > **Live demo:** https://saas-starter-ashy.vercel.app/
@@ -46,6 +48,8 @@ What makes it robust, in one breath each:
 - **One source of policy.** Handler and worker import the same `retry-policy.ts` and `processEvent` — the two paths *can't* drift, because there's only one definition of "back off," "dead-letter," and "what an event does."
 
 It runs on **free tiers with zero extra infrastructure** — no Redis, no queue, no distributed lock. The database's own guarantees do the coordination.
+
+**These guarantees are tested, not just claimed.** A resilience suite runs the real claim queries against a Postgres service container in CI on every push — proving that concurrent claims yield one winner, contended reclaims yield one winner, repeated failures terminate in `dead_letter`, and stale `processing` rows recover. (The badge above is green when they pass.)
 
 → **Full reasoning, with the "what breaks without it" walkthrough for each decision:** [ENGINEERING_NOTES.md §0 — The webhook engine](./ENGINEERING_NOTES.md#0-the-webhook-engine--the-hard-decisions)
 
