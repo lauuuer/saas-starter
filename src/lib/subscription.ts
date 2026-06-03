@@ -10,6 +10,13 @@ const STRIPE_TIMEOUT_MS = 8_000;
 /**
  * Envolve uma promise com timeout. Em caso de estouro, rejeita explicitamente
  * em vez de deixar a chamada pendurada indefinidamente.
+ *
+ * Quando o timeout vence a corrida, a promise original continua pendente e
+ * NINGUÉM mais aguarda seu resultado. Se ela rejeitar depois (ex.: a chamada
+ * lenta ao Stripe acaba falhando após o estouro), seria uma unhandledRejection.
+ * Por isso anexamos um catch no-op ao perdedor da corrida: não muda o desfecho
+ * (já decidido por Promise.race), apenas garante que a rejeição tardia tenha um
+ * handler e não polua o log como erro não tratado.
  */
 export async function withTimeout<T>(
   promise: Promise<T>,
@@ -23,6 +30,8 @@ export async function withTimeout<T>(
       ms
     );
   });
+  // Evita unhandledRejection caso a promise original rejeite após perder a corrida.
+  promise.catch(() => {});
   try {
     return await Promise.race([promise, timeout]);
   } finally {

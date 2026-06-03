@@ -12,6 +12,45 @@ A production-minded subscription platform built with **Next.js 15 (App Router)**
 Most payment integrations in a portfolio stop at "checkout works." This one focuses on the part that actually breaks in production: **the webhook pipeline**. It implements concurrency-safe idempotency, bounded retries with exponential backoff, a dead-letter path, an async reprocessing worker, and a health endpoint for alerting — all on **free tiers, with no extra infrastructure**.
 
 > 📓 See [ENGINEERING_NOTES.md](./ENGINEERING_NOTES.md) for the full build journey — bugs hit, debugging, and the reasoning behind each decision.
+> 🔧 See [HARDENING_NOTES.md](./HARDENING_NOTES.md) for the working review log — ground state, conscious trade-offs, fixes applied, and items reviewed-and-deliberately-not-fixed.
+
+---
+
+## Resilience & failure handling
+
+The webhook pipeline is the part of this project worth your attention. It's not "save the event and call a function" — it's a small **durable state machine with an atomic claim protocol**, built to survive the failure modes that make billing webhooks genuinely hard: duplicate deliveries, *concurrent* deliveries, partial failures, a serverless process dying mid-work, and a payment provider (Stripe) that redelivers the same event for ~3 days.
+
+Every Stripe event becomes a `WebhookEvent` row that moves through four states. The design goal is that **every transition is either atomic or idempotent**, so no crash, race, or redelivery can leave a paying user in the wrong billing state:
+
+```mermaid
+stateDiagram-v2
+    [*] --> processing: claim — INSERT event.id (unique constraint = the lock)
+
+    processing --> processed: processEvent() ok
+    processing --> failed: processEvent() threw, attempts < MAX_ATTEMPTS
+    processing --> dead_letter: processEvent() threw, attempts >= MAX_ATTEMPTS
+
+    failed --> processing: reclaim (CAS on status) — redelivery OR worker
+    processing --> processing: stale reclaim — holder died, stuck > STALE_PROCESSING_MS
+
+    processed --> [*]: terminal (success)
+    dead_letter --> [*]: terminal (manual intervention)
+```
+
+What makes it robust, in one breath each:
+
+- **The unique constraint is the lock.** The Stripe `event.id` is the primary key; claiming an event *is* the `INSERT`. Two concurrent redeliveries of the same event race to insert the same key — exactly one wins, the rest short-circuit as duplicates. There is no check-then-act window, because the check **is** the write. ([why this beats `findUnique → process`](./ENGINEERING_NOTES.md#02-why-the-atomic-claim-is-the-whole-ballgame))
+- **Idempotent by contract, not by accident.** Stripe delivers at-least-once; the business effect is a *reconciliation* keyed by `stripeSubscriptionId`, not an increment — so replaying an event converges to the same row.
+- **Bounded retries → dead-letter, never an infinite loop.** Exponential backoff with jitter for transient failures; after 8 attempts the event becomes `dead_letter` (terminal) so a deterministic bug can't burn the same error forever. Dead-letter is a deliberate "a human must look" state, surfaced by the health endpoint.
+- **Two lines of defense, in order.** Stripe's own ~3-day redelivery is the *first* line; a Vercel Cron worker reusing the **same** `processEvent` is the last resort, catching events Stripe gave up on and `processing` rows whose holder died.
+- **Survives process death.** A `processing` row left stale by a killed invocation is reclaimed via compare-and-swap; the worker also stops taking new work before its `maxDuration`, so it isn't killed mid-event.
+- **One source of policy.** Handler and worker import the same `retry-policy.ts` and `processEvent` — the two paths *can't* drift, because there's only one definition of "back off," "dead-letter," and "what an event does."
+
+It runs on **free tiers with zero extra infrastructure** — no Redis, no queue, no distributed lock. The database's own guarantees do the coordination.
+
+→ **Full reasoning, with the "what breaks without it" walkthrough for each decision:** [ENGINEERING_NOTES.md §0 — The webhook engine](./ENGINEERING_NOTES.md#0-the-webhook-engine--the-hard-decisions)
+
+---
 
 ## Tech stack
 
@@ -27,7 +66,9 @@ Most payment integrations in a portfolio stop at "checkout works." This one focu
 
 ---
 
-## Architecture highlights
+## Architecture highlights — detailed reference
+
+The section above is the summary; this is the point-by-point detail, file by file.
 
 ### Production-grade webhook handler (`src/app/api/stripe/webhook/route.ts`)
 
@@ -81,7 +122,7 @@ The endpoint is protected by `HEALTH_TOKEN`, accepted via `Authorization: Bearer
 
 ### Other resilience decisions
 
-- **Stripe API version compatibility.** Recent Stripe API versions moved `current_period_end` from the subscription level to each item (`items.data[].current_period_end`). Code reading the old field gets `undefined` silently — and in billing, that denies access to a paying user. `extractCurrentPeriodEnd` reads the item level with a top-level fallback, covering both shapes.
+- **Stripe API version compatibility.** Recent Stripe API versions moved `current_period_end` from the subscription level to each item (`items.data[].current_period_end`). Code reading the old field gets `undefined` silently — and in billing, that denies access to a paying user. `extractCurrentPeriodEnd` reads the item level with a top-level fallback, covering both shapes. Against the pinned SDK (`stripe@17.7.0`, Acacia) the field is still top-level, so the fallback branch is the live one today; the item-level read is dormant forward-compatibility that activates on a future Basil-era SDK bump with no code change.
 - **Stripe Customer creation race.** Two concurrent checkouts could create two Customers (an unguarded dual-write), orphaning one. Solved with an `idempotencyKey` derived from the `userId`: Stripe returns the same Customer.
 - **Resilient webhook reconciliation.** `syncSubscription` reconciles first by `stripeCustomerId`; if not found, it falls back to the `userId` propagated via `metadata` (written on both the checkout session and the subscription via `subscription_data.metadata`) and repairs the link (self-healing). Without this, a paid subscription could be silently dropped.
 - **Explicit status mapping.** An unknown Stripe status throws (and enters the retry flow) instead of becoming invalid data via `as any`.

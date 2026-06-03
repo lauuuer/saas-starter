@@ -3,3 +3,6 @@ node_modules
 .env
 .env*.local
 .DS_Store
+
+# Internal hardening / review log — not for the public repo
+HARDENING_NOTES.md

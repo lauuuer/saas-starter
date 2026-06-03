@@ -2,6 +2,134 @@
 
 A record of the architecture, the problems hit while building and deploying, and how each was resolved. The goal is to show the reasoning, not just the final result.
 
+If you only read one section, read the next one — it's where the real engineering lives.
+
+---
+
+## 0. The webhook engine — the hard decisions
+
+The webhook pipeline looks, at a glance, like "save the event, do the thing, and run a cron job to mop up." That framing undersells it. What's actually implemented is a small, durable **state machine with an atomic claim protocol**, designed to survive the failure modes that make billing webhooks notoriously hard to get right: duplicate deliveries, concurrent deliveries, partial failures, process death mid-work, and a payment provider that retries the same event for days. This section walks through each decision and — just as important — what would break without it.
+
+### 0.1 The event state machine
+
+Every Stripe event becomes a `WebhookEvent` row whose `status` moves through a deliberately small set of states. The whole design is an effort to make every transition either **atomic** or **idempotent**, so that no crash, race, or redelivery can leave a paying user in the wrong billing state.
+
+```mermaid
+stateDiagram-v2
+    [*] --> processing: claim — INSERT event.id (unique constraint = the lock)
+
+    processing --> processed: processEvent() ok
+    processing --> failed: processEvent() threw, attempts < MAX_ATTEMPTS
+    processing --> dead_letter: processEvent() threw, attempts >= MAX_ATTEMPTS
+
+    failed --> processing: reclaim (CAS on status) — redelivery OR worker
+    processing --> processing: stale reclaim — holder died, stuck > STALE_PROCESSING_MS
+
+    processed --> [*]: terminal (success)
+    dead_letter --> [*]: terminal (manual intervention)
+
+    note right of processing
+        Only ONE invocation can hold "processing"
+        for a given event at a time.
+        The transition INTO processing is the lock.
+    end note
+
+    note right of failed
+        nextRetryAt = now + backoff(attempts).
+        Worker won't touch it until then.
+    end note
+```
+
+Plain-text version (same thing, for environments that don't render Mermaid):
+
+```
+                 INSERT event.id (status=processing)
+   [ Stripe ] ─────────────────────────────────────────►( processing )
+                 unique constraint is the lock                │
+                                                              │ processEvent()
+                          ┌───────────────────────────────────┼───────────────────────────┐
+                          │ ok                                 │ threw                      │ threw
+                          ▼                                    ▼ (attempts < MAX)           ▼ (attempts >= MAX)
+                    ( processed )                          ( failed )                ( dead_letter )
+                      terminal                                 │                         terminal
+                      success                                  │ nextRetryAt = now+backoff   (manual fix)
+                                                               │
+                                       reclaim (CAS on status):│
+                                       redelivery OR cron worker│
+                                                               ▼
+                                                        ( processing )  ◄── stale reclaim if a
+                                                                            holder died (> STALE_PROCESSING_MS)
+```
+
+Four states, and the discipline is that you can only *enter* `processing` by winning an atomic write. Everything else follows from that.
+
+### 0.2 Why the atomic claim is the whole ballgame
+
+The single most important line in the system is the `INSERT` of `event.id`:
+
+```ts
+await prisma.webhookEvent.create({
+  data: { id: event.id, status: WebhookStatus.processing, payload: body, attempts: 1 },
+});
+```
+
+`event.id` is the primary key. The **unique constraint is the lock.** Two deliveries of the same event — and Stripe *will* deliver the same event more than once, by design — race to insert the same primary key. Exactly one wins; the loser gets `P2002` (unique violation) and bails out as a duplicate. There is no window between "check if it exists" and "act on it," because the check *is* the act. It's a compare-and-swap implemented by the database's strongest guarantee.
+
+The redelivery/retry path uses the same idea, expressed as a conditional `updateMany`:
+
+```ts
+const reclaimed = await prisma.webhookEvent.updateMany({
+  where: { id: event.id, status: existing.status }, // CAS: only if status is still what I observed
+  data:  { status: WebhookStatus.processing, attempts: { increment: 1 } },
+});
+if (reclaimed.count === 0) { /* someone else reclaimed it first → treat as duplicate */ }
+```
+
+The `where` clause pins the status I *observed a moment ago*. If anyone else (a concurrent redelivery, or the cron worker) moved that row between my read and my write, my update matches zero rows and I back off. This is optimistic concurrency control — no `SELECT ... FOR UPDATE`, no advisory lock, no Redis. The row's own status column is the lock token.
+
+**What breaks without it.** Suppose you replaced the claim with the naïve `findUnique` → `if (!exists) process()` pattern. Stripe sends an event; your serverless platform, under a burst, spins up two concurrent invocations for two redeliveries of *the same* event. Both call `findUnique`, both see "not processed," both call `processEvent`. Now `syncSubscription` runs twice concurrently. Best case, the second write is a harmless no-op. Worst case, they interleave — two `Customer` creations, a subscription written then half-overwritten, an upgrade applied twice. In billing, "process exactly once" isn't a nicety; double-processing is how a customer gets double-charged or a cancellation gets resurrected. The atomic claim turns "exactly once" from a hope into an invariant enforced by the database.
+
+### 0.3 Why idempotency is mandatory here (not optional)
+
+Stripe's delivery contract is **at-least-once**, not exactly-once. The [docs are explicit](https://stripe.com/docs/webhooks): you may receive the same event multiple times, and you must be prepared for it. Reasons range from network blips (Stripe sent it, your `2xx` got lost, Stripe retries) to Stripe's own internal retries to manual replays from the dashboard.
+
+So idempotency isn't a defensive flourish — it's the price of admission. This system gets it on two levels:
+
+1. **Delivery-level idempotency** via the claim. The same `event.id` can arrive ten times; only the first insert wins, the rest short-circuit. The DB key *is* the dedupe key.
+2. **Effect-level idempotency** in `processEvent`. Even setting the claim aside, the business effect is a *reconciliation*, not an *increment*. `syncSubscription` reads the current subscription state from Stripe and writes the resulting truth, keyed by `stripeSubscriptionId` (a unique upsert target). Running it twice with the same input converges to the same row. There's no `balance += amount` anywhere that would corrupt under replay.
+
+The two layers are belt-and-suspenders on purpose: the claim prevents *concurrent* double-processing, and the reconciliation shape makes *sequential* reprocessing (a failed event retried later) safe. You need both, because the retry path deliberately re-runs `processEvent` on events that previously failed.
+
+### 0.4 Why dead-letter instead of infinite retry
+
+Failures come in two flavors, and conflating them is a classic outage amplifier:
+
+- **Transient** — a timeout, a pool exhaustion, a brief Stripe blip. Retrying later fixes it.
+- **Deterministic** — a malformed payload, an unmapped enum, a bug in `processEvent`. Retrying *never* fixes it; it just burns the same error forever.
+
+Retrying a deterministic failure on every redelivery is a tight failure loop: Stripe redelivers for ~3 days, your worker re-attempts on every cron tick, and each attempt does the same expensive cross-region work only to throw the same error — while burying the signal of *real* transient failures under the noise. `decideFailureOutcome` draws the line: under `MAX_ATTEMPTS` (8), schedule a backed-off retry; at the ceiling, move to `dead_letter` (terminal) and stop. `dead_letter` is a deliberate "a human needs to look at this" state, surfaced by the health endpoint, rather than a silent infinite spin. The cost of being wrong about "transient vs deterministic" is bounded to 8 attempts with exponential backoff, not unbounded.
+
+### 0.5 Two lines of defense, in order
+
+The retry story has a specific ordering that's easy to miss:
+
+1. **Stripe is the first line of defense.** When the handler returns a `500`, Stripe redelivers — with its own backoff — for up to ~3 days. For the overwhelming majority of transient failures, *Stripe's* redelivery resolves the event before your worker ever touches it. The handler returning `500` on failure isn't an error path bolted on; it's actively recruiting Stripe's retry infrastructure as the primary recovery mechanism.
+2. **The cron worker is the last resort.** It exists for the events that fall through: ones where Stripe eventually gave up, or where the failure outlived the redelivery window, or a `processing` row whose holder died mid-flight (the serverless function was killed). The worker scans for `failed` rows past their `nextRetryAt` and stale `processing` rows, reclaims them with the same atomic CAS, and re-runs the identical `processEvent`. It's not doing different work — it's the same engine, triggered by a different clock.
+
+This ordering is *why* a once-daily cron on the free tier is defensible (see §4): Stripe is already covering the first hours of retries. The worker only has to catch the long tail.
+
+One precision worth stating, because it's easy to misread the code: the `nextRetryAt` backoff computed by `computeBackoffMs` is the **worker's** clock, not the handler's. When Stripe redelivers a `failed` event to the synchronous handler, the handler reclaims and reprocesses it immediately — it does *not* consult `nextRetryAt`. That's deliberate and correct: Stripe already applies its own backoff to redeliveries, so on the synchronous path we defer to Stripe's schedule. `nextRetryAt` exists to pace the *worker's* candidate scan, which is the only consumer of the backoff window. The two clocks don't conflict; they govern two different paths.
+
+### 0.6 Surviving process death (the stale reclaim)
+
+Serverless functions get killed — cold-start budget exceeded, `maxDuration` hit, platform eviction. If an invocation dies *after* claiming an event (status = `processing`) but *before* finishing, that row would be stuck forever in `processing`, never picked up again, because the claim succeeded. That's a silent stuck event — the worst kind, because nothing errors.
+
+The defense is `STALE_PROCESSING_MS`. A `processing` row whose `updatedAt` is older than the staleness window is treated as abandoned and is eligible for reclaim — by the handler (on a later redelivery) or by the worker. The reclaim is the same atomic CAS, so if the original holder somehow wasn't dead and finishes, only one of them wins the terminal write. The loop deadline in the worker (`LOOP_DEADLINE_MS` < `maxDuration`) is the complementary half: the worker stops *taking new work* before the platform can kill it mid-event, minimizing how often events get orphaned in the first place.
+
+### 0.7 Single source of policy
+
+Both entry points — the synchronous handler and the asynchronous worker — import the *same* `retry-policy.ts` (`computeBackoffMs`, `decideFailureOutcome`, `MAX_ATTEMPTS`, `STALE_PROCESSING_MS`) and the *same* `webhook-processor.ts` (`processEvent`). There is exactly one definition of "how long to back off," "when to dead-letter," and "what an event actually does." A change to the policy can't make the two paths drift apart, because there's only one path's worth of logic. This is the difference between two code paths that *happen* to agree today and one shared contract that *must* agree.
+
 ---
 
 ## 1. Architecture overview
@@ -94,7 +222,8 @@ Added Vitest unit tests for the retry policy (backoff growth, 1h cap, jitter bou
 
 Documented to show the reasoning behind specific choices:
 
-- **Stripe API version compatibility.** Recent Stripe versions moved `current_period_end` from the subscription to each item. Reading the old field returns `undefined` silently — which in billing means denying access to a paying user. `extractCurrentPeriodEnd` reads item-level with a top-level fallback.
+- **Stripe API version compatibility.** Recent Stripe versions moved `current_period_end` from the subscription to each item. Reading the old field returns `undefined` silently — which in billing means denying access to a paying user. `extractCurrentPeriodEnd` reads item-level with a top-level fallback. A precise note on the current state: against the *pinned* SDK (`stripe@17.7.0`, `apiVersion 2025-02-24.acacia`), `current_period_end` still lives at the top level and `SubscriptionItem` carries no such field, so today the function always takes the fallback branch. The item-level read is intentional forward-compatibility — it's dormant under Acacia and will activate automatically on a future Basil-era SDK bump, with no code change. Documenting it as dormant-by-design rather than currently-load-bearing keeps the prose honest about which branch executes.
+- **Timeout that doesn't orphan its loser.** `withTimeout` races a real call against a timeout. When the timeout wins, the original promise is still pending and unobserved; a later rejection from it (e.g. a slow Stripe call that eventually errors *after* the timeout fired) would surface as an `unhandledRejection`. A no-op `.catch` is attached to the racing promise so the late rejection always has a handler — it doesn't change the outcome (already decided by the race), only prevents stray unhandled-rejection noise in the logs.
 - **Stripe Customer creation race.** Two concurrent checkouts could create two Customers. An `idempotencyKey` derived from the `userId` makes Stripe return the same one.
 - **Self-healing reconciliation.** `syncSubscription` reconciles by `stripeCustomerId`, falling back to a `userId` carried in metadata (set on both the checkout session and the subscription) and repairing the link if the first write failed.
 - **Explicit status mapping.** An unknown Stripe status throws (entering the retry flow) rather than writing invalid data via `as any`.
@@ -105,15 +234,17 @@ Documented to show the reasoning behind specific choices:
 ## 4. Known trade-offs (free-tier constraints)
 
 - **Inline processing instead of a true queue.** The maximally robust pattern returns `2xx` immediately and processes in a separate worker/queue. To stay 100% free with no extra infra, processing runs inline with a timeout and atomic claim, with the raw payload persisted so a worker can take over later. Conscious middle path.
-- **Vercel Cron runs once/day on Hobby** and doesn't retry failed invocations, so the worker uses a large batch to drain the backlog in one pass. Stripe covers the first hours of retries, so a daily safety net is sufficient. On a paid plan: smaller batch, `*/5 * * * *` schedule.
+- **Vercel Cron runs once/day on Hobby** (the schedule in `vercel.json` is honored at most daily regardless of the cron expression) and — critically — **does not retry a failed cron invocation**. If the single daily worker run errors out or is evicted, there is no second attempt until tomorrow. The design absorbs this in two ways: (a) the batch is large (`BATCH_SIZE = 50`) so one run drains the whole backlog in a pass, and (b) Stripe's own ~3-day redelivery (§0.5) covers the first hours, so a daily safety net is genuinely sufficient for the failure modes that survive Stripe. The honest limitation: on Hobby, the *worst-case* latency for an event that Stripe gave up on, before the worker reaches it, is up to ~24h. For a portfolio demo that's fine; for real billing it isn't.
+  - **What changes on Pro:** the cron can run on a real sub-hourly schedule (`*/5 * * * *`), so shrink `BATCH_SIZE` and let frequency do the draining. A failed invocation still isn't auto-retried by Vercel Cron, but at 5-minute cadence the next tick *is* effectively the retry, so it stops mattering. Worst-case worker latency drops from ~24h to ~5min.
 - **DB region.** Should be co-located with the deploy region in production. The cross-region setup used here is fine for a portfolio demo but is the root cause of the local timeout observations above.
 
 ---
 
 ## 5. What I'd do next (production hardening)
 
-- Move side-effect processing to a real queue (e.g. a durable job runner) and return `2xx` on persist.
-- Co-locate Postgres with the Vercel region.
-- Add an integration test for the claim-then-process path against a test database.
-- Wire the health endpoint to an external monitor with alerting on `dead_letter > 0`.
-- Pin exact dependency versions for reproducible builds.
+- **Move side-effect processing to a real queue and return `2xx` on persist.** The maximally robust pattern decouples *receiving* from *processing*: the handler verifies the signature, persists the raw event, enqueues a job, and returns `2xx` immediately — so Stripe is never waiting on `processEvent`, and a slow downstream dependency can't cause Stripe-visible failures. A durable queue (SQS, Cloud Tasks, QStash, or a Postgres-backed runner like River/Graphile Worker) becomes the retry engine, replacing the cron worker. The good news: the current schema already supports this transition almost for free. The raw `payload` is persisted and `processEvent` is a pure function of the event, so the queue worker is the *same* `processEvent` call triggered by a queue message instead of a cron tick. The state machine in §0 doesn't change; only what pulls events out of `failed`/`processing` does.
+- **Run multiple worker instances safely — which the design already permits.** The atomic claim (§0.2) is precisely what makes horizontal scaling free of extra coordination. Today there's one cron invocation; with a queue you could have N concurrent workers competing for the same backlog. Because every worker must win the conditional `updateMany` (CAS on status) before doing work, two workers grabbing the same event is a non-event: one wins, the other's update matches zero rows and it moves on. No distributed lock, no leader election, no partitioning required — the per-row claim *is* the coordination. The one thing to add at higher concurrency is `SELECT ... FOR UPDATE SKIP LOCKED` (or the queue's own visibility-timeout semantics) on the candidate scan, so N workers don't all fetch the *same* batch of candidates and then mostly lose the CAS; that turns wasted CAS attempts into disjoint work assignment.
+- **Co-locate Postgres with the Vercel region** to remove the cross-region latency that caused the timeout observations in §2.
+- **Add an integration test for the claim-then-process path against a real test database** (the resilience test added in this pass covers the policy and the claim logic against a stubbed processor; an end-to-end test against Postgres would close the last gap).
+- **Wire the health endpoint to an external monitor** with alerting on `dead_letter > 0` and on a stalled `oldestPendingAgeMs`.
+- **Pin exact dependency versions** for reproducible builds (the `^` ranges caused two separate build breaks in §2).
