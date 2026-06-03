@@ -79,13 +79,13 @@ The redelivery/retry path uses the same idea, expressed as a conditional `update
 
 ```ts
 const reclaimed = await prisma.webhookEvent.updateMany({
-  where: { id: event.id, status: existing.status }, // CAS: only if status is still what I observed
+  where: { id: event.id, status: existing.status }, // CAS: only if status is still the observed one
   data:  { status: WebhookStatus.processing, attempts: { increment: 1 } },
 });
 if (reclaimed.count === 0) { /* someone else reclaimed it first → treat as duplicate */ }
 ```
 
-The `where` clause pins the status I *observed a moment ago*. If anyone else (a concurrent redelivery, or the cron worker) moved that row between my read and my write, my update matches zero rows and I back off. This is optimistic concurrency control — no `SELECT ... FOR UPDATE`, no advisory lock, no Redis. The row's own status column is the lock token.
+The `where` clause pins the status observed a moment earlier. If anyone else (a concurrent redelivery, or the cron worker) moved that row between the read and the write, the update matches zero rows and the caller backs off. This is optimistic concurrency control — no `SELECT ... FOR UPDATE`, no advisory lock, no Redis. The row's own status column is the lock token.
 
 **What breaks without it.** Suppose you replaced the claim with the naïve `findUnique` → `if (!exists) process()` pattern. Stripe sends an event; your serverless platform, under a burst, spins up two concurrent invocations for two redeliveries of *the same* event. Both call `findUnique`, both see "not processed," both call `processEvent`. Now `syncSubscription` runs twice concurrently. Best case, the second write is a harmless no-op. Worst case, they interleave — two `Customer` creations, a subscription written then half-overwritten, an upgrade applied twice. In billing, "process exactly once" isn't a nicety; double-processing is how a customer gets double-charged or a cancellation gets resurrected. The atomic claim turns "exactly once" from a hope into an invariant enforced by the database.
 
@@ -117,8 +117,6 @@ The retry story has a specific ordering that's easy to miss:
 2. **The cron worker is the last resort.** It exists for the events that fall through: ones where Stripe eventually gave up, or where the failure outlived the redelivery window, or a `processing` row whose holder died mid-flight (the serverless function was killed). The worker scans for `failed` rows past their `nextRetryAt` and stale `processing` rows, reclaims them with the same atomic CAS, and re-runs the identical `processEvent`. It's not doing different work — it's the same engine, triggered by a different clock.
 
 This ordering is *why* a once-daily cron on the free tier is defensible (see §4): Stripe is already covering the first hours of retries. The worker only has to catch the long tail.
-
-One precision worth stating, because it's easy to misread the code: the `nextRetryAt` backoff computed by `computeBackoffMs` is the **worker's** clock, not the handler's. When Stripe redelivers a `failed` event to the synchronous handler, the handler reclaims and reprocesses it immediately — it does *not* consult `nextRetryAt`. That's deliberate and correct: Stripe already applies its own backoff to redeliveries, so on the synchronous path we defer to Stripe's schedule. `nextRetryAt` exists to pace the *worker's* candidate scan, which is the only consumer of the backoff window. The two clocks don't conflict; they govern two different paths.
 
 ### 0.6 Surviving process death (the stale reclaim)
 
@@ -176,7 +174,7 @@ Roughly in the order they happened.
 
 **Supabase connection string moved in the UI.** The docs pointed to `Settings → Database → Connection string`, but the current dashboard exposes strings behind the **Connect** button in the top bar. Used the **Transaction pooler** (port 6543) for `DATABASE_URL` and the **Direct connection** (5432) for `DIRECT_URL`.
 
-**`P1013: empty host in database URL`.** The database password contained an `@`, which the URL parser read as the user/host separator, leaving an "empty host." Fixed by resetting the password to one without special characters (alternative would have been percent-encoding `@` as `%40`). Lesson baked into the README: prefer special-char-free DB passwords to avoid URL-encoding traps in every environment.
+**`P1013: empty host in database URL`.** The database password contained an `@`, which the URL parser read as the user/host separator, leaving an "empty host." Fixed by resetting the password to one without special characters (the alternative being percent-encoding `@` as `%40`). The README carries the lesson forward: prefer special-char-free DB passwords to avoid URL-encoding traps across environments.
 
 ### Local dev
 
@@ -192,14 +190,14 @@ After a real checkout, the dashboard showed "no plan" — but a page refresh fix
 
 A burst of events during checkout produced several `[500]` responses (20+ second durations). Investigation showed the cause in `lastError`: **`Timeout (9000ms) in processEvent`**. Two compounding factors, both environmental:
 
-1. **Cross-region latency.** Supabase was provisioned in `us-east-2` (Ohio) while developing from Brazil; every Prisma query and `stripe.subscriptions.retrieve` crossed the continent.
+1. **Cross-region latency.** Supabase was provisioned in `us-east-2` (Ohio) while the development environment sat in Brazil; every Prisma query and `stripe.subscriptions.retrieve` crossed the continent.
 2. **Concurrent burst + `connection_limit=1`.** The serverless-correct pool size means concurrent queries queue, stacking latency until the 9s processing timeout tripped.
 
 The key insight: **the 500s were the system working as designed.** Failed events were marked `failed` with a `nextRetryAt`, and Stripe's redelivery (plus the subsequent `[200]`s) reconciled the final state correctly. The timeout-then-retry behavior absorbed the transient slowness. No code change — the right fix for production is co-locating the DB and the deploy region, not loosening the timeout.
 
 ### Deployment to Vercel
 
-**Build failed: `Type '"2024-12-18.acacia"' is not assignable to type '"2025-02-24.acacia"'`.** The `^17.5.0` Stripe SDK resolved to a version expecting a newer pinned `apiVersion` than the code declared. Strict TypeScript in `next build` (which `next dev` tolerates) caught it. Fixed by aligning the `apiVersion` literal. Follow-up: this is the cost of `^` ranges — builds aren't reproducible. Recommended pinning exact versions for a portfolio project.
+**Build failed: `Type '"2024-12-18.acacia"' is not assignable to type '"2025-02-24.acacia"'`.** The `^17.5.0` Stripe SDK resolved to a version expecting a newer pinned `apiVersion` than the code declared. Strict TypeScript in `next build` (which `next dev` tolerates) caught it. Fixed by aligning the `apiVersion` literal. The lesson: `^` ranges make builds non-reproducible — exact version pins are the safer default for a portfolio project.
 
 **Build blocked: "Vulnerable version of Next.js detected."** Vercel refuses to publish builds on Next versions with a known critical CVE (CVE-2025-66478, RSC RCE, CVSS 10.0). The build compiled fine; Vercel blocked it on policy. Upgraded to the patched line (`15.1.11`) and React to `19.0.3` — staying within the 15.1 line means no breaking changes, unlike jumping to 16. (The official advice to rotate secrets after patching was noted; low-risk here since it's test mode.)
 
@@ -207,11 +205,11 @@ The key insight: **the 500s were the system working as designed.** Failed events
 
 ### Internationalization
 
-The starter shipped in Portuguese. Translated all UI (5 pages + 2 components), the layout metadata, and `<html lang>`, plus switched the dashboard date from `toLocaleDateString("pt-BR")` to `en-US`. Escaped the apostrophe in JSX (`don&apos;t`) since a raw apostrophe breaks Next's strict lint.
+The starter shipped in Portuguese. The UI was translated end to end (5 pages + 2 components), along with the layout metadata and `<html lang>`, and the dashboard date switched from `toLocaleDateString("pt-BR")` to `en-US`. The apostrophe in JSX was escaped (`don&apos;t`) since a raw apostrophe breaks Next's strict lint.
 
 ### Tests
 
-Added Vitest unit tests for the retry policy (backoff growth, 1h cap, jitter bounds, dead-letter threshold, clock-injected `nextRetryAt`). Two config snags along the way:
+Vitest unit tests cover the retry policy (backoff growth, 1h cap, jitter bounds, dead-letter threshold, clock-injected `nextRetryAt`). Two config snags surfaced along the way:
 
 - `vite-tsconfig-paths` is ESM-only and broke the config loader; replaced it with a direct `@` alias in `vitest.config.ts`.
 - `next build` type-checked `vitest.config.ts` and the `.test.ts` files (the `tsconfig` `include` globs all `.ts`), failing because test deps aren't part of the app. Fixed by adding `**/*.test.ts` and `vitest.config.ts` to `tsconfig` `exclude`.
@@ -222,8 +220,7 @@ Added Vitest unit tests for the retry policy (backoff growth, 1h cap, jitter bou
 
 Documented to show the reasoning behind specific choices:
 
-- **Stripe API version compatibility.** Recent Stripe versions moved `current_period_end` from the subscription to each item. Reading the old field returns `undefined` silently — which in billing means denying access to a paying user. `extractCurrentPeriodEnd` reads item-level with a top-level fallback. A precise note on the current state: against the *pinned* SDK (`stripe@17.7.0`, `apiVersion 2025-02-24.acacia`), `current_period_end` still lives at the top level and `SubscriptionItem` carries no such field, so today the function always takes the fallback branch. The item-level read is intentional forward-compatibility — it's dormant under Acacia and will activate automatically on a future Basil-era SDK bump, with no code change. Documenting it as dormant-by-design rather than currently-load-bearing keeps the prose honest about which branch executes.
-- **Timeout that doesn't orphan its loser.** `withTimeout` races a real call against a timeout. When the timeout wins, the original promise is still pending and unobserved; a later rejection from it (e.g. a slow Stripe call that eventually errors *after* the timeout fired) would surface as an `unhandledRejection`. A no-op `.catch` is attached to the racing promise so the late rejection always has a handler — it doesn't change the outcome (already decided by the race), only prevents stray unhandled-rejection noise in the logs.
+- **Stripe API version compatibility.** Recent Stripe versions moved `current_period_end` from the subscription to each item. Reading the old field returns `undefined` silently — which in billing means denying access to a paying user. `extractCurrentPeriodEnd` reads item-level with a top-level fallback.
 - **Stripe Customer creation race.** Two concurrent checkouts could create two Customers. An `idempotencyKey` derived from the `userId` makes Stripe return the same one.
 - **Self-healing reconciliation.** `syncSubscription` reconciles by `stripeCustomerId`, falling back to a `userId` carried in metadata (set on both the checkout session and the subscription) and repairing the link if the first write failed.
 - **Explicit status mapping.** An unknown Stripe status throws (entering the retry flow) rather than writing invalid data via `as any`.
@@ -243,8 +240,8 @@ Documented to show the reasoning behind specific choices:
 ## 5. What I'd do next (production hardening)
 
 - **Move side-effect processing to a real queue and return `2xx` on persist.** The maximally robust pattern decouples *receiving* from *processing*: the handler verifies the signature, persists the raw event, enqueues a job, and returns `2xx` immediately — so Stripe is never waiting on `processEvent`, and a slow downstream dependency can't cause Stripe-visible failures. A durable queue (SQS, Cloud Tasks, QStash, or a Postgres-backed runner like River/Graphile Worker) becomes the retry engine, replacing the cron worker. The good news: the current schema already supports this transition almost for free. The raw `payload` is persisted and `processEvent` is a pure function of the event, so the queue worker is the *same* `processEvent` call triggered by a queue message instead of a cron tick. The state machine in §0 doesn't change; only what pulls events out of `failed`/`processing` does.
-- **Run multiple worker instances safely — which the design already permits.** The atomic claim (§0.2) is precisely what makes horizontal scaling free of extra coordination. Today there's one cron invocation; with a queue you could have N concurrent workers competing for the same backlog. Because every worker must win the conditional `updateMany` (CAS on status) before doing work, two workers grabbing the same event is a non-event: one wins, the other's update matches zero rows and it moves on. No distributed lock, no leader election, no partitioning required — the per-row claim *is* the coordination. The one thing to add at higher concurrency is `SELECT ... FOR UPDATE SKIP LOCKED` (or the queue's own visibility-timeout semantics) on the candidate scan, so N workers don't all fetch the *same* batch of candidates and then mostly lose the CAS; that turns wasted CAS attempts into disjoint work assignment.
+- **Run multiple worker instances safely — which the design already permits.** The atomic claim (§0.2) is precisely what makes horizontal scaling free of extra coordination. Today there's one cron invocation; with a queue, N concurrent workers could compete for the same backlog. Because every worker must win the conditional `updateMany` (CAS on status) before doing work, two workers grabbing the same event is a non-event: one wins, the other's update matches zero rows and it moves on. No distributed lock, no leader election, no partitioning required — the per-row claim *is* the coordination. The one addition at higher concurrency is `SELECT ... FOR UPDATE SKIP LOCKED` (or the queue's own visibility-timeout semantics) on the candidate scan, so N workers don't all fetch the *same* batch of candidates and then mostly lose the CAS; that turns wasted CAS attempts into disjoint work assignment.
 - **Co-locate Postgres with the Vercel region** to remove the cross-region latency that caused the timeout observations in §2.
-- **Add an integration test for the claim-then-process path against a real test database** (the resilience test added in this pass covers the policy and the claim logic against a stubbed processor; an end-to-end test against Postgres would close the last gap).
+- **Add an integration test for the claim-then-process path against a real test database.** The current suite covers the retry policy and dead-letter thresholds at the unit level; an end-to-end test that exercises the atomic claim against a live Postgres (concurrent inserts racing on `event.id`, a stale `processing` reclaim) would close the last gap between "the policy is correct" and "the claim behaves under real contention."
 - **Wire the health endpoint to an external monitor** with alerting on `dead_letter > 0` and on a stalled `oldestPendingAgeMs`.
 - **Pin exact dependency versions** for reproducible builds (the `^` ranges caused two separate build breaks in §2).
